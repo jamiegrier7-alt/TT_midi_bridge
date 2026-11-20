@@ -113,6 +113,41 @@ The MIDI bridge automatically detects the MacroPad on its serial device and esta
 
 ## Software Setup
 
+Modified .bashrc to make everything boot and use the correct audio interface etc... 
+
+# Auto-start Audio Routing, Hardware Bridge & ChooChooTracker on local DSI console (tty1)
+if [ "$(tty)" = "/dev/tty1" ]; then
+    # Wait up to 5 seconds for snd_rpi_proto (card 0) to finish registering
+    for i in {1..10}; do
+        [ -d /proc/asound/card0 ] && break
+        sleep 0.5
+    done
+
+    apply_tt_audio() {
+        amixer -c 0 sset 'Input Mux' 'Line In' > /dev/null 2>&1
+        amixer -c 0 sset 'Line' cap > /dev/null 2>&1
+        amixer -c 0 sset 'Capture' 23 > /dev/null 2>&1
+        amixer -c 0 sset 'Mic' nocap mute > /dev/null 2>&1
+        amixer -c 0 sset 'Output Mixer HiFi' on > /dev/null 2>&1
+    }
+
+    apply_tt_audio
+    # Re-apply 3 seconds later in case alsa-restore or SDL2 initialization resets WM8731 registers
+    (sleep 3 && apply_tt_audio) &
+
+    # Start midi_bridge in the background if it isn't already running
+    if ! pgrep -x "midi_bridge" > /dev/null; then
+        ~/midi_bridge 7bit choochoo > /tmp/midi_bridge.log 2>&1 &
+    fi
+
+    # Launch ChooChooTracker full-screen directly on the DSI framebuffer
+    SDL_VIDEODRIVER=kmsdrm \
+    SDL_AUDIODRIVER=alsa \
+    AUDIODEV=default \
+    ~/Documents/ChooChooTracker-Linux/choochootracker
+fi
+
+
 ### Building the Bridge
 
 ```bash
