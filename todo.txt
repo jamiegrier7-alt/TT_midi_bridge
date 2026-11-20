@@ -1,0 +1,65 @@
+# Firmware Refactoring Todos
+
+## macro-3.ino (Adafruit MacroPad Firmware)
+
+### Structure & Architecture
+- [ ] Refactor macro-3.ino into modules
+  Description: Separate hardware I/O, state machines, rendering, and serial parsing into distinct components. Currently all mixed in loop() and event handlers.
+
+- [ ] Break loop() into smaller functions
+  Description: Main loop is 60+ lines mixing keypad, encoder, serial reading. Split into updateKeypad(), updateEncoder(), updateSerial().
+
+- [ ] Consolidate repeated UI rendering patterns
+  Description: drawMainMenu(), drawNamingKeyboard(), drawFileBrowser() duplicate layout logic. Create generic menu renderer.
+
+### Performance & Memory
+- [ ] Replace String class with char buffers
+  Description: Using String for FUDI parsing and file buffers is wasteful on microcontroller. Use fixed-size char arrays or preallocated buffers.
+
+- [ ] Optimize getFudiArg() to avoid rescans
+  Description: Current implementation rescans string from start for each argument. Create single-pass tokenizer instead.
+
+### Code Quality
+- [ ] Extract magic numbers to named constants
+  Description: Display coordinates (43, 11, 128, 64), pixel mappings, timing (400ms) scattered throughout. Centralize in header.
+
+- [ ] Replace long if-else chains with command dispatch table
+  Description: parseFudiCommand() has 12+ conditions. Use array of function pointers for FUDI commands.
+
+- [ ] Add error handling for FUDI parsing and buffer overflow
+  Description: No validation if file buffer overflows (MAX_FILES=30). No recovery if FUDI parse fails.
+
+---
+
+## 16n Firmware (Sweet16 MKII Faderbank)
+
+### Architecture & Organization
+- [ ] Create platform abstraction layer for V125 vs standard Teensy
+  Description: 11+ #ifdef V125 blocks with duplicated I2C and port initialization. Extract into platform-specific files.
+
+- [ ] Split 716-line file into separate modules
+  Description: Create I2C.cpp, MIDI.cpp, analog.cpp, config.cpp for maintainability. Keep main file under 300 lines.
+
+- [ ] Reduce global state - consolidate 50+ variables into structs
+  Description: currentValue[], lastMidiValue[], i2cMidiHead, i2cMidiTail, etc. Group by subsystem (ADC, MIDI, I2C).
+
+### Configuration & Constants
+- [ ] Move hardcoded device addresses to config.h
+  Description: ansibleI2Caddress=0x20, er301I2Caddress=0x31, txoI2Caddress=0x60, I2C speed 400000 scattered throughout.
+
+- [ ] Move ResponsiveAnalogRead thresholds to config
+  Description: Activity threshold hardcoded as 32 (4 << 3). Should be per-channel configurable.
+
+- [ ] Document why muxMapping reverses channel order
+  Description: const int muxMapping[16] = {0,1,2,...15,14,13,...8} has no comment explaining hardware layout.
+
+### Performance & Reliability
+- [ ] Replace full bus scan with configurable device list
+  Description: Scans all 120 I2C addresses on boot to find 3 devices. Store known addresses in EEPROM if found once.
+
+- [ ] Add timeout and error recovery for I2C communication
+  Description: Wire.setDefaultTimeout(10000) but no handling if device stops responding or message fails.
+
+### Code Cleanup
+- [ ] Remove commented I2C-to-MIDI struct (lines 143-155)
+  Description: Dead code hints at incomplete I2C-to-MIDI bridge integration. Document or remove.
