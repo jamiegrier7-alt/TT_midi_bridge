@@ -1,5 +1,7 @@
 # TT MIDI Bridge - Standalone Eurorack MIDI Interface
 
+![EuroTracker](EuroTracker.jpg)
+
 A unified hardware interface that connects Terminal Tedium and Sweet16 MKII controllers to a Raspberry Pi running **ChooChooTracker** or **PureData** as a standalone music-making system.
 
 This project uses a **modified 16n faderbank firmware** to enable I2C-to-MIDI conversion on the Sweet16 MKII hardware, creating a bidirectional MIDI bridge between analog controls and software sequencers/synths.
