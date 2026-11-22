@@ -18,7 +18,7 @@
  *   → Bridges hardware controls to software via MIDI
  * 
  * This bridge:
- * 1. Reads faders from Sweet16 MKII via I2C
+ * 1. Reads faders from Sweet Sixteen MKII via I2C
  * 2. Reads pots from Terminal Tedium via SPI
  * 3. Sends MIDI CC data to ChooChooTracker/PureData
  * 4. Receives MIDI commands from software
@@ -42,6 +42,7 @@
 #include <iostream>
 #include <vector>
 #include <string>
+#include <cerrno>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -61,20 +62,32 @@ bool g_debug = false;
 
 #define DEBUG_PRINT(...) \
     do { if (g_debug) { std::fprintf(stderr, "[DEBUG] "); std::fprintf(stderr, __VA_ARGS__); } } while(0)
-
-// ============================================================================
-// GPIO Global Objects (libgpiod C API)
-// ============================================================================
-
-// GPIO chip and line objects (C API)
-static struct gpiod_chip* g_gpio_chip = nullptr;
-static struct gpiod_line* g_button_lines[NUM_TT_BUTTONS] = {nullptr, nullptr, nullptr};
-static struct gpiod_line* g_gate_in_lines[NUM_TT_GATES_IN] = {nullptr, nullptr, nullptr, nullptr};
-static struct gpiod_line* g_gate_out_lines[NUM_TT_GATES_OUT] = {nullptr, nullptr};
+#define DEBUG_COUT(...) \
+    do { if (g_debug) { std::cout << __VA_ARGS__; } } while(0)
+#define DEBUG_CERR(...) \
+    do { if (g_debug) { std::cerr << __VA_ARGS__; } } while(0)
 
 // ============================================================================
 // Hardware Configuration
 // ============================================================================
+
+// Terminal Tedium Buttons (GPIO inputs)
+constexpr int NUM_TT_BUTTONS = 3;
+constexpr int TT_BUTTON1_GPIO = 23;
+constexpr int TT_BUTTON2_GPIO = 25;
+constexpr int TT_BUTTON3_GPIO = 24;
+
+// Terminal Tedium Gate Inputs (clock/gate inputs - GPIO)
+constexpr int NUM_TT_GATES_IN = 4;
+constexpr int TT_GATE_IN1_GPIO = 4;
+constexpr int TT_GATE_IN2_GPIO = 14;
+constexpr int TT_GATE_IN3_GPIO = 17;
+constexpr int TT_GATE_IN4_GPIO = 27;
+
+// Terminal Tedium Gate Outputs (GPIO - for LED/gate output)
+constexpr int NUM_TT_GATES_OUT = 2;
+constexpr int TT_GATE_OUT1_GPIO = 16;
+constexpr int TT_GATE_OUT2_GPIO = 26;
 
 // Sweet Sixteen Fader Controller (I2C)
 constexpr const char* I2C_DEVICE = "/dev/i2c-1";
@@ -91,30 +104,21 @@ constexpr uint8_t TT_CC_OFFSET = 16;    // CC 16-21 for pots
 constexpr int POT_ADC_MAX = 4095;       // 12-bit ADC
 constexpr int POT_DEADZONE = 8;         // Threshold for change detection
 
-// Terminal Tedium Buttons (GPIO inputs)
-constexpr int NUM_TT_BUTTONS = 3;       // Button 1, Button 2, and Button 3
-constexpr int TT_BUTTON1_GPIO = 23;     // GPIO pin for Button 1 (top)
-constexpr int TT_BUTTON2_GPIO = 24;     // GPIO pin for Button 2 (middle)
-constexpr int TT_BUTTON3_GPIO = 25;     // GPIO pin for Button 3 (bottom)
-
-// Terminal Tedium Gate Inputs (clock/gate inputs - GPIO)
-constexpr int NUM_TT_GATES_IN = 4;
-constexpr int TT_GATE_IN1_GPIO = 4;     // GPIO pin for Gate Input 1
-constexpr int TT_GATE_IN2_GPIO = 14;    // GPIO pin for Gate Input 2
-constexpr int TT_GATE_IN3_GPIO = 17;    // GPIO pin for Gate Input 3
-constexpr int TT_GATE_IN4_GPIO = 27;    // GPIO pin for Gate Input 4
-
-// Terminal Tedium Gate Outputs (GPIO - for LED/gate output)
-constexpr int NUM_TT_GATES_OUT = 2;
-constexpr int TT_GATE_OUT1_GPIO = 16;   // GPIO pin for Gate Output 1
-constexpr int TT_GATE_OUT2_GPIO = 26;   // GPIO pin for Gate Output 2
-
 // Adafruit MacroPad (Serial USB)
 constexpr const char* MACROPAD_SERIAL = "/dev/serial/by-id/usb-Adafruit_MacroPad_RP2040_DF643CF013616025-if00";
 
 // MIDI Configuration
 constexpr uint8_t MIDI_CHANNEL = 0;
 constexpr uint16_t POLL_INTERVAL_US = 5000;
+
+// ============================================================================
+// GPIO Global Objects (libgpiod C API, v2)
+// ============================================================================
+
+static struct gpiod_chip* g_gpio_chip = nullptr;
+static struct gpiod_line_request* g_button_lines = nullptr;
+static struct gpiod_line_request* g_gate_in_lines = nullptr;
+static struct gpiod_line_request* g_gate_out_lines = nullptr;
 
 // ============================================================================
 // I2C Fader Reading (Sweet Sixteen)
@@ -189,80 +193,129 @@ int read_mcp3208_spi(int spi_fd, uint8_t channel, uint16_t& out_val) {
  * Returns 0 on success, -1 on error.
  */
 int init_gpio_libgpiod() {
-    try {
-        // Open the GPIO chip (gpiochip0 on Raspberry Pi)
-        g_gpio_chip = new chip("gpiochip0");
-        if (!g_gpio_chip) {
-            std::cerr << "Failed to open GPIO chip" << std::endl;
-            return -1;
-        }
-        
-        DEBUG_PRINT("Opened GPIO chip: gpiochip0\n");
-        
-        // Configure button lines (GPIO 23, 24, 25) as inputs
-        line_settings button_settings;
-        button_settings.set_direction(line::direction::INPUT);
-        
-        request_builder button_builder(*g_gpio_chip);
-        button_builder.set_consumer("tt_buttons");
-        button_builder.add_line_settings(TT_BUTTON1_GPIO, button_settings);
-        button_builder.add_line_settings(TT_BUTTON2_GPIO, button_settings);
-        button_builder.add_line_settings(TT_BUTTON3_GPIO, button_settings);
-        
-        g_button_lines = new line_request(button_builder);
-        if (!g_button_lines) {
-            std::cerr << "Failed to request button lines" << std::endl;
-            return -1;
-        }
-        
-        std::cout << "[TT] Button lines initialized (GPIO " << TT_BUTTON1_GPIO << ", "
-                  << TT_BUTTON2_GPIO << ", " << TT_BUTTON3_GPIO << ")" << std::endl;
-        
-        // Configure gate input lines (GPIO 4, 14, 17, 27) as inputs
-        line_settings gate_in_settings;
-        gate_in_settings.set_direction(line::direction::INPUT);
-        
-        request_builder gate_in_builder(*g_gpio_chip);
-        gate_in_builder.set_consumer("tt_gate_in");
-        gate_in_builder.add_line_settings(TT_GATE_IN1_GPIO, gate_in_settings);
-        gate_in_builder.add_line_settings(TT_GATE_IN2_GPIO, gate_in_settings);
-        gate_in_builder.add_line_settings(TT_GATE_IN3_GPIO, gate_in_settings);
-        gate_in_builder.add_line_settings(TT_GATE_IN4_GPIO, gate_in_settings);
-        
-        g_gate_in_lines = new line_request(gate_in_builder);
-        if (!g_gate_in_lines) {
-            std::cerr << "Failed to request gate input lines" << std::endl;
-            return -1;
-        }
-        
-        std::cout << "[TT] Gate input lines initialized (GPIO " << TT_GATE_IN1_GPIO << ", "
-                  << TT_GATE_IN2_GPIO << ", " << TT_GATE_IN3_GPIO << ", " << TT_GATE_IN4_GPIO << ")" << std::endl;
-        
-        // Configure gate output lines (GPIO 16, 26) as outputs
-        line_settings gate_out_settings;
-        gate_out_settings.set_direction(line::direction::OUTPUT);
-        gate_out_settings.set_output_value(line::value::INACTIVE);
-        
-        request_builder gate_out_builder(*g_gpio_chip);
-        gate_out_builder.set_consumer("tt_gate_out");
-        gate_out_builder.add_line_settings(TT_GATE_OUT1_GPIO, gate_out_settings);
-        gate_out_builder.add_line_settings(TT_GATE_OUT2_GPIO, gate_out_settings);
-        
-        g_gate_out_lines = new line_request(gate_out_builder);
-        if (!g_gate_out_lines) {
-            std::cerr << "Failed to request gate output lines" << std::endl;
-            return -1;
-        }
-        
-        std::cout << "[TT] Gate output lines initialized (GPIO " << TT_GATE_OUT1_GPIO << ", "
-                  << TT_GATE_OUT2_GPIO << ")" << std::endl;
-        
-        return 0;
-        
-    } catch (const std::exception& e) {
-        std::cerr << "GPIO initialization error: " << e.what() << std::endl;
+    g_gpio_chip = gpiod_chip_open("/dev/gpiochip0");
+    if (!g_gpio_chip) {
+        DEBUG_CERR("Failed to open /dev/gpiochip0: " << strerror(errno) << std::endl);
         return -1;
     }
+
+    // Button inputs: use pull-up, so an unpressed line is inactive (0)
+    // and pressing a normally-open button to ground is active (1).
+    const unsigned int button_offsets[NUM_TT_BUTTONS] = {
+        static_cast<unsigned int>(TT_BUTTON1_GPIO),
+        static_cast<unsigned int>(TT_BUTTON2_GPIO),
+        static_cast<unsigned int>(TT_BUTTON3_GPIO)
+    };
+
+    gpiod_line_settings* button_settings = gpiod_line_settings_new();
+    gpiod_line_config* button_config = gpiod_line_config_new();
+    if (!button_settings || !button_config) {
+        if (button_settings) gpiod_line_settings_free(button_settings);
+        if (button_config) gpiod_line_config_free(button_config);
+        gpiod_chip_close(g_gpio_chip);
+        g_gpio_chip = nullptr;
+        return -1;
+    }
+    gpiod_line_settings_set_direction(button_settings, GPIOD_LINE_DIRECTION_INPUT);
+    gpiod_line_settings_set_bias(button_settings, GPIOD_LINE_BIAS_PULL_UP);
+    gpiod_line_settings_set_active_low(button_settings, true);
+    if (gpiod_line_config_add_line_settings(button_config, button_offsets, NUM_TT_BUTTONS, button_settings) < 0) {
+        DEBUG_CERR("Failed to configure TT button lines: " << strerror(errno) << std::endl);
+        if (button_settings) gpiod_line_settings_free(button_settings);
+        if (button_config) gpiod_line_config_free(button_config);
+        gpiod_chip_close(g_gpio_chip);
+        g_gpio_chip = nullptr;
+        return -1;
+    }
+
+    g_button_lines = gpiod_chip_request_lines(g_gpio_chip, nullptr, button_config);
+    gpiod_line_settings_free(button_settings);
+    gpiod_line_config_free(button_config);
+    if (!g_button_lines) {
+        DEBUG_CERR("Failed to request TT button lines: " << strerror(errno) << std::endl);
+        gpiod_chip_close(g_gpio_chip);
+        g_gpio_chip = nullptr;
+        return -1;
+    }
+
+    // Gate inputs: use pull-down so a rising external gate becomes active.
+    const unsigned int gate_in_offsets[NUM_TT_GATES_IN] = {
+        static_cast<unsigned int>(TT_GATE_IN1_GPIO),
+        static_cast<unsigned int>(TT_GATE_IN2_GPIO),
+        static_cast<unsigned int>(TT_GATE_IN3_GPIO),
+        static_cast<unsigned int>(TT_GATE_IN4_GPIO)
+    };
+
+    gpiod_line_settings* gate_in_settings = gpiod_line_settings_new();
+    gpiod_line_config* gate_in_config = gpiod_line_config_new();
+    if (!gate_in_settings || !gate_in_config ||
+        gpiod_line_settings_set_direction(gate_in_settings, GPIOD_LINE_DIRECTION_INPUT) < 0 ||
+        gpiod_line_settings_set_bias(gate_in_settings, GPIOD_LINE_BIAS_PULL_DOWN) < 0 ||
+        gpiod_line_config_add_line_settings(gate_in_config, gate_in_offsets, NUM_TT_GATES_IN, gate_in_settings) < 0) {
+        DEBUG_CERR("Failed to configure TT gate input lines: " << strerror(errno) << std::endl);
+        if (gate_in_settings) gpiod_line_settings_free(gate_in_settings);
+        if (gate_in_config) gpiod_line_config_free(gate_in_config);
+        gpiod_line_request_release(g_button_lines);
+        g_button_lines = nullptr;
+        gpiod_chip_close(g_gpio_chip);
+        g_gpio_chip = nullptr;
+        return -1;
+    }
+
+    g_gate_in_lines = gpiod_chip_request_lines(g_gpio_chip, nullptr, gate_in_config);
+    gpiod_line_settings_free(gate_in_settings);
+    gpiod_line_config_free(gate_in_config);
+    if (!g_gate_in_lines) {
+        DEBUG_CERR("Failed to request TT gate input lines: " << strerror(errno) << std::endl);
+        gpiod_line_request_release(g_button_lines);
+        g_button_lines = nullptr;
+        gpiod_chip_close(g_gpio_chip);
+        g_gpio_chip = nullptr;
+        return -1;
+    }
+
+    // Gate outputs: configure as outputs, initially inactive (low).
+    const unsigned int gate_out_offsets[NUM_TT_GATES_OUT] = {
+        static_cast<unsigned int>(TT_GATE_OUT1_GPIO),
+        static_cast<unsigned int>(TT_GATE_OUT2_GPIO)
+    };
+
+    gpiod_line_settings* gate_out_settings = gpiod_line_settings_new();
+    gpiod_line_config* gate_out_config = gpiod_line_config_new();
+    if (!gate_out_settings || !gate_out_config ||
+        gpiod_line_settings_set_direction(gate_out_settings, GPIOD_LINE_DIRECTION_OUTPUT) < 0 ||
+        gpiod_line_settings_set_output_value(gate_out_settings, GPIOD_LINE_VALUE_INACTIVE) < 0 ||
+        gpiod_line_config_add_line_settings(gate_out_config, gate_out_offsets, NUM_TT_GATES_OUT, gate_out_settings) < 0) {
+        DEBUG_CERR("Failed to configure TT gate output lines: " << strerror(errno) << std::endl);
+        if (gate_out_settings) gpiod_line_settings_free(gate_out_settings);
+        if (gate_out_config) gpiod_line_config_free(gate_out_config);
+        gpiod_line_request_release(g_gate_in_lines);
+        g_gate_in_lines = nullptr;
+        gpiod_line_request_release(g_button_lines);
+        g_button_lines = nullptr;
+        gpiod_chip_close(g_gpio_chip);
+        g_gpio_chip = nullptr;
+        return -1;
+    }
+
+    g_gate_out_lines = gpiod_chip_request_lines(g_gpio_chip, nullptr, gate_out_config);
+    gpiod_line_settings_free(gate_out_settings);
+    gpiod_line_config_free(gate_out_config);
+    if (!g_gate_out_lines) {
+        DEBUG_CERR("Failed to request TT gate output lines: " << strerror(errno) << std::endl);
+        gpiod_line_request_release(g_gate_in_lines);
+        g_gate_in_lines = nullptr;
+        gpiod_line_request_release(g_button_lines);
+        g_button_lines = nullptr;
+        gpiod_chip_close(g_gpio_chip);
+        g_gpio_chip = nullptr;
+        return -1;
+    }
+
+    DEBUG_COUT("[TT] Gate output lines initialized (GPIO " << TT_GATE_OUT1_GPIO << ", "
+              << TT_GATE_OUT2_GPIO << ")" << std::endl);
+
+    return 0;
 }
 
 /**
@@ -273,15 +326,14 @@ int init_gpio_libgpiod() {
  */
 int read_button_libgpiod(int button_num) {
     if (!g_button_lines || button_num < 0 || button_num >= NUM_TT_BUTTONS) return -1;
-    
-    try {
-        // Note: line indexing is 0-2 for the 3 button lines
-        line::value val = g_button_lines->get_value(button_num);
-        return (val == line::value::ACTIVE) ? 1 : 0;
-    } catch (const std::exception& e) {
-        DEBUG_PRINT("Button %d read error: %s\n", button_num, e.what());
-        return -1;
-    }
+    const unsigned int offsets[NUM_TT_BUTTONS] = {
+        static_cast<unsigned int>(TT_BUTTON1_GPIO),
+        static_cast<unsigned int>(TT_BUTTON2_GPIO),
+        static_cast<unsigned int>(TT_BUTTON3_GPIO)
+    };
+    enum gpiod_line_value val = gpiod_line_request_get_value(g_button_lines, offsets[button_num]);
+    if (val == GPIOD_LINE_VALUE_ERROR) return -1;
+    return val == GPIOD_LINE_VALUE_ACTIVE ? 1 : 0;
 }
 
 /**
@@ -292,14 +344,15 @@ int read_button_libgpiod(int button_num) {
  */
 int read_gate_input_libgpiod(int gate_num) {
     if (!g_gate_in_lines || gate_num < 0 || gate_num >= NUM_TT_GATES_IN) return -1;
-    
-    try {
-        line::value val = g_gate_in_lines->get_value(gate_num);
-        return (val == line::value::ACTIVE) ? 1 : 0;
-    } catch (const std::exception& e) {
-        DEBUG_PRINT("Gate input %d read error: %s\n", gate_num, e.what());
-        return -1;
-    }
+    const unsigned int offsets[NUM_TT_GATES_IN] = {
+        static_cast<unsigned int>(TT_GATE_IN1_GPIO),
+        static_cast<unsigned int>(TT_GATE_IN2_GPIO),
+        static_cast<unsigned int>(TT_GATE_IN3_GPIO),
+        static_cast<unsigned int>(TT_GATE_IN4_GPIO)
+    };
+    enum gpiod_line_value val = gpiod_line_request_get_value(g_gate_in_lines, offsets[gate_num]);
+    if (val == GPIOD_LINE_VALUE_ERROR) return -1;
+    return val == GPIOD_LINE_VALUE_ACTIVE ? 1 : 0;
 }
 
 /**
@@ -311,35 +364,32 @@ int read_gate_input_libgpiod(int gate_num) {
  */
 int set_gate_output_libgpiod(int gate_num, int value) {
     if (!g_gate_out_lines || gate_num < 0 || gate_num >= NUM_TT_GATES_OUT) return -1;
-    
-    try {
-        line::value val = (value != 0) ? line::value::ACTIVE : line::value::INACTIVE;
-        g_gate_out_lines->set_value(gate_num, val);
-        return 0;
-    } catch (const std::exception& e) {
-        DEBUG_PRINT("Gate output %d write error: %s\n", gate_num, e.what());
-        return -1;
-    }
+    const unsigned int offsets[NUM_TT_GATES_OUT] = {
+        static_cast<unsigned int>(TT_GATE_OUT1_GPIO),
+        static_cast<unsigned int>(TT_GATE_OUT2_GPIO)
+    };
+    enum gpiod_line_value val = value != 0 ? GPIOD_LINE_VALUE_ACTIVE : GPIOD_LINE_VALUE_INACTIVE;
+    return gpiod_line_request_set_value(g_gate_out_lines, offsets[gate_num], val);
 }
 
 /**
  * cleanup_gpio_libgpiod: Clean up GPIO resources
  */
 void cleanup_gpio_libgpiod() {
-    if (g_button_lines) {
-        delete g_button_lines;
-        g_button_lines = nullptr;
-    }
-    if (g_gate_in_lines) {
-        delete g_gate_in_lines;
-        g_gate_in_lines = nullptr;
-    }
     if (g_gate_out_lines) {
-        delete g_gate_out_lines;
+        gpiod_line_request_release(g_gate_out_lines);
         g_gate_out_lines = nullptr;
     }
+    if (g_gate_in_lines) {
+        gpiod_line_request_release(g_gate_in_lines);
+        g_gate_in_lines = nullptr;
+    }
+    if (g_button_lines) {
+        gpiod_line_request_release(g_button_lines);
+        g_button_lines = nullptr;
+    }
     if (g_gpio_chip) {
-        delete g_gpio_chip;
+        gpiod_chip_close(g_gpio_chip);
         g_gpio_chip = nullptr;
     }
 }
@@ -469,11 +519,11 @@ void process_alsa_input(snd_seq_t* seq, int i2c_fd, MacroPadBridge& macropad) {
 int init_i2c() {
     int fd = open(I2C_DEVICE, O_RDWR);
     if (fd < 0) {
-        std::cerr << "Failed to open " << I2C_DEVICE << std::endl;
+        DEBUG_CERR("Failed to open " << I2C_DEVICE << std::endl);
         return -1;
     }
     if (ioctl(fd, I2C_SLAVE, SWEET16_ADDR) < 0) {
-        std::cerr << "Failed to set I2C slave address 0x" << std::hex << SWEET16_ADDR << std::endl;
+        DEBUG_CERR("Failed to set I2C slave address 0x" << std::hex << SWEET16_ADDR << std::endl);
         close(fd);
         return -1;
     }
@@ -488,7 +538,7 @@ int init_i2c() {
 int init_spi() {
     int fd = open(SPI_DEVICE, O_RDWR);
     if (fd < 0) {
-        std::cerr << "Warning: SPI device " << SPI_DEVICE << " not available (Terminal Tedium pots disabled)" << std::endl;
+        DEBUG_CERR("Warning: SPI device " << SPI_DEVICE << " not available (Terminal Tedium pots disabled)" << std::endl);
         return -1;
     }
 
@@ -498,7 +548,7 @@ int init_spi() {
     if (ioctl(fd, SPI_IOC_WR_MODE, &spi_mode) < 0 ||
         ioctl(fd, SPI_IOC_WR_BITS_PER_WORD, &spi_bits) < 0 ||
         ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ, &spi_speed) < 0) {
-        std::cerr << "Warning: Failed to configure SPI (Terminal Tedium pots disabled)" << std::endl;
+        DEBUG_CERR("Warning: Failed to configure SPI (Terminal Tedium pots disabled)" << std::endl);
         close(fd);
         return -1;
     }
@@ -515,7 +565,7 @@ int init_spi() {
  */
 int init_alsa(snd_seq_t** seq_handle, int& out_port, int& in_port) {
     if (snd_seq_open(seq_handle, "default", SND_SEQ_OPEN_DUPLEX, 0) < 0) {
-        std::cerr << "Error opening ALSA sequencer" << std::endl;
+        DEBUG_CERR("Error opening ALSA sequencer" << std::endl);
         return -1;
     }
     
@@ -531,7 +581,7 @@ int init_alsa(snd_seq_t** seq_handle, int& out_port, int& in_port) {
         SND_SEQ_PORT_TYPE_MIDI_GENERIC | SND_SEQ_PORT_TYPE_APPLICATION);
 
     if (out_port < 0 || in_port < 0) {
-        std::cerr << "Error creating ALSA ports" << std::endl;
+        DEBUG_CERR("Error creating ALSA ports" << std::endl);
         snd_seq_close(*seq_handle);
         return -1;
     }
@@ -544,7 +594,7 @@ int init_alsa(snd_seq_t** seq_handle, int& out_port, int& in_port) {
 
 int main(int argc, char* argv[]) {
     if (argc < 2 || argc > 4) {
-        std::cerr << "Usage: " << argv[0] << " <14bit|7bit> [trackwerk|choochoo|puredata] [--debug]" << std::endl;
+        DEBUG_CERR("Usage: " << argv[0] << " <14bit|7bit> [trackwerk|choochoo|puredata] [--debug]" << std::endl);
         return 1;
     }
 
@@ -552,7 +602,7 @@ int main(int argc, char* argv[]) {
     std::string bit_mode = argv[1];
     bool is_14bit = (bit_mode == "14bit");
     if (bit_mode != "14bit" && bit_mode != "7bit") {
-        std::cerr << "Invalid bit mode '" << bit_mode << "'. Use '14bit' or '7bit'." << std::endl;
+        DEBUG_CERR("Invalid bit mode '" << bit_mode << "'. Use '14bit|7bit'." << std::endl);
         return 1;
     }
 
@@ -568,10 +618,8 @@ int main(int argc, char* argv[]) {
             g_debug = true;
             arg_idx++;
         } else {
-            std::cerr << "Invalid MacroPad mode '" << m << "'." << std::endl;
-            return 1;
+            arg_idx++;
         }
-        arg_idx++;
     }
     
     if (arg_idx < argc && std::string(argv[arg_idx]) == "--debug") {
@@ -580,7 +628,9 @@ int main(int argc, char* argv[]) {
 
     // Initialize hardware
     int i2c_fd = init_i2c();
-    if (i2c_fd < 0) return 1;
+    if (i2c_fd < 0) {
+        return 1;
+    }
 
     int spi_fd = init_spi();
 
@@ -592,35 +642,36 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    MacroPadBridge macropad(MACROPAD_SERIAL, macro_mode);
+    MacroPadBridge macropad(MACROPAD_SERIAL, macro_mode, g_debug);
 
-    std::cout << "MIDI Bridge active [" << bit_mode << " mode | MacroPad: " 
-              << macropad.mode_name() << "]" << std::endl;
+    DEBUG_COUT("MIDI Bridge active [" << bit_mode << " mode | MacroPad: "
+              << macropad.mode_name() << "]" << std::endl);
 
     // Initialize Terminal Tedium GPIO using libgpiod
     if (init_gpio_libgpiod() < 0) {
-        std::cerr << "Failed to initialize Terminal Tedium GPIO. Exiting." << std::endl;
+        DEBUG_CERR("Failed to initialize Terminal Tedium GPIO. Exiting." << std::endl);
         if (spi_fd >= 0) close(spi_fd);
         close(i2c_fd);
         snd_seq_close(seq_handle);
         return 1;
     }
     
-    std::cout << "[TT] Terminal Tedium GPIO initialized (libgpiod):" << std::endl;
-    std::cout << "  - Buttons: GPIO " << TT_BUTTON1_GPIO << ", " << TT_BUTTON2_GPIO << ", " << TT_BUTTON3_GPIO << std::endl;
-    std::cout << "  - Gate Inputs: GPIO " << TT_GATE_IN1_GPIO << ", " << TT_GATE_IN2_GPIO << ", " 
-              << TT_GATE_IN3_GPIO << ", " << TT_GATE_IN4_GPIO << std::endl;
-    std::cout << "  - Gate Outputs: GPIO " << TT_GATE_OUT1_GPIO << ", " << TT_GATE_OUT2_GPIO << std::endl;
+    DEBUG_COUT("[TT] Terminal Tedium GPIO initialized (libgpiod):" << std::endl);
+    DEBUG_COUT("  - Buttons: GPIO " << TT_BUTTON1_GPIO << ", " << TT_BUTTON2_GPIO << ", " << TT_BUTTON3_GPIO << std::endl);
+    DEBUG_COUT("  - Gate Inputs: GPIO " << TT_GATE_IN1_GPIO << ", " << TT_GATE_IN2_GPIO << ", "
+               << TT_GATE_IN3_GPIO << ", " << TT_GATE_IN4_GPIO << std::endl);
+    DEBUG_COUT("  - Gate Outputs: GPIO " << TT_GATE_OUT1_GPIO << ", " << TT_GATE_OUT2_GPIO << std::endl);
     
-    // Flash gate outputs to show GPIO is working
-    DEBUG_PRINT("GPIO Health Check: Flashing gate outputs...\n");
-    set_gate_output_libgpiod(0, 1);
-    usleep(100000);
-    set_gate_output_libgpiod(0, 0);
-    usleep(100000);
-    set_gate_output_libgpiod(1, 1);
-    usleep(100000);
-    set_gate_output_libgpiod(1, 0);
+    // Flash gate outputs three times at startup to show GPIO is working.
+    DEBUG_COUT("[TT] GPIO health check: flashing gate outputs 3 times" << std::endl);
+    for (int flash = 0; flash < 3; ++flash) {
+        set_gate_output_libgpiod(0, 1);
+        set_gate_output_libgpiod(1, 1);
+        usleep(500000);
+        set_gate_output_libgpiod(0, 0);
+        set_gate_output_libgpiod(1, 0);
+        usleep(500000);
+    }
 
     // State tracking for hysteresis (deadzone filtering)
     std::vector<uint16_t> last_fader_values(NUM_FADERS, 0xFFFF);
@@ -628,7 +679,9 @@ int main(int argc, char* argv[]) {
     std::vector<uint16_t> last_pot_raw(NUM_TT_POTS, 0xFFFF);
     
     // Terminal Tedium button state tracking
-    int last_btn1_state = 0, last_btn2_state = 0, last_btn3_state = 0;
+    int last_btn1_state = read_button_libgpiod(0);
+    int last_btn2_state = read_button_libgpiod(1);
+    int last_btn3_state = read_button_libgpiod(2);
     
     // Terminal Tedium gate input state tracking
     int last_gate_in[NUM_TT_GATES_IN] = {0, 0, 0, 0};
@@ -645,44 +698,57 @@ int main(int argc, char* argv[]) {
         int btn1_state = read_button_libgpiod(0);
         int btn2_state = read_button_libgpiod(1);
         int btn3_state = read_button_libgpiod(2);
-        
-        DEBUG_PRINT("TT Button states: btn1=%d btn2=%d btn3=%d\n", btn1_state, btn2_state, btn3_state);
+
+        if (btn1_state != last_btn1_state)
+            DEBUG_PRINT("TT Button 1 state: %d\n", btn1_state);
+        if (btn2_state != last_btn2_state)
+            DEBUG_PRINT("TT Button 2 state: %d\n", btn2_state);
+        if (btn3_state != last_btn3_state)
+            DEBUG_PRINT("TT Button 3 state: %d\n", btn3_state);
+
+        if (macropad.is_system_control_mode()) {
+            if (btn1_state == 1 && last_btn1_state == 0)
+                macropad.handle_system_control_button(1);
+            if (btn2_state == 1 && last_btn2_state == 0)
+                macropad.handle_system_control_button(2);
+            if (btn3_state == 1 && last_btn3_state == 0)
+                macropad.handle_system_control_button(3);
+        }
         
         // Detect button events (rising edges - when button is pressed)
-        if (btn1_state == 1 && last_btn1_state == 0) {
-            DEBUG_PRINT("TT Button 1 PRESSED\n");
-            macropad.send_fudi("cls");
-            macropad.send_fudi("prn 20 10 1 BUTTON 1");
-            macropad.send_fudi("prn 20 25 1 PRESSED");
-            std::cout << "[TT] Button 1 pressed" << std::endl;
-        }
-        
-        if (btn2_state == 1 && last_btn2_state == 0) {
-            DEBUG_PRINT("TT Button 2 PRESSED\n");
-            macropad.send_fudi("cls");
-            macropad.send_fudi("prn 20 10 1 BUTTON 2");
-            macropad.send_fudi("prn 20 25 1 PRESSED");
-            std::cout << "[TT] Button 2 pressed" << std::endl;
-        }
-        
-        if (btn3_state == 1 && last_btn3_state == 0) {
-            DEBUG_PRINT("TT Button 3 PRESSED\n");
-            macropad.send_fudi("cls");
-            macropad.send_fudi("prn 20 10 1 BUTTON 3");
-            macropad.send_fudi("prn 20 25 1 PRESSED");
-            std::cout << "[TT] Button 3 pressed" << std::endl;
+        if (!macropad.is_system_control_mode()) {
+            if (btn1_state == 1 && last_btn1_state == 0) {
+                if (g_debug) {
+                    macropad.send_fudi("cls");
+                    macropad.send_fudi("prn 20 10 1 BUTTON 1");
+                    std::cout << "[TT] Button 1 pressed" << std::endl;
+                }
+            }
+            if (btn2_state == 1 && last_btn2_state == 0) {
+                if (g_debug) {
+                    macropad.send_fudi("cls");
+                    macropad.send_fudi("prn 20 10 1 BUTTON 2");
+                    std::cout << "[TT] Button 2 pressed" << std::endl;
+                }
+            }
+            if (btn3_state == 1 && last_btn3_state == 0) {
+                if (g_debug) {
+                    macropad.send_fudi("cls");
+                    macropad.send_fudi("prn 20 10 1 BUTTON 3");
+                    std::cout << "[TT] Button 3 pressed" << std::endl;
+                }
+            }
         }
         
         // Detect button combo: 1+2 pressed (rising edge)
-        if (btn1_state == 1 && btn2_state == 1 && last_btn1_state == 0) {
-            DEBUG_PRINT("TT Button combo 1+2 DETECTED\n");
+        if (!macropad.is_system_control_mode() && btn1_state == 1 && btn2_state == 1 && last_btn1_state == 0) {
             macropad.set_system_control_mode(true);
             // Send display message to MacroPad
             macropad.send_fudi("cls");
             macropad.send_fudi("prn 20 10 1 REBOOT?");
             macropad.send_fudi("prn 20 25 1 SHUTDOWN?");
             macropad.send_fudi("prn 15 40 1 CANCEL?");
-            std::cout << "[TT] Button combo 1+2 detected - showing system control prompt" << std::endl;
+            if (g_debug) std::cout << "[TT] Button combo 1+2 detected - showing system control prompt" << std::endl;
         }
         
         last_btn1_state = btn1_state;
@@ -695,9 +761,6 @@ int main(int argc, char* argv[]) {
         gate_in_states[1] = read_gate_input_libgpiod(1);
         gate_in_states[2] = read_gate_input_libgpiod(2);
         gate_in_states[3] = read_gate_input_libgpiod(3);
-        
-        DEBUG_PRINT("TT Gate IN states: in1=%d in2=%d in3=%d in4=%d\n", 
-                    gate_in_states[0], gate_in_states[1], gate_in_states[2], gate_in_states[3]);
         
         // Detect gate input changes (rising edges)
         for (int g = 0; g < NUM_TT_GATES_IN; ++g) {

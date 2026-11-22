@@ -29,8 +29,9 @@ struct KeyCell {
 
 class MacroPadBridge {
 public:
-    MacroPadBridge(const std::string& serial_dev, MacroMode initial_mode)
-        : port_path_(serial_dev), mode_(initial_mode), serial_fd_(-1), uinput_fd_(-1), udp_fd_(-1), system_control_mode_(false) {
+    MacroPadBridge(const std::string& serial_dev, MacroMode initial_mode, bool debug = false)
+        : port_path_(serial_dev), mode_(initial_mode), serial_fd_(-1), uinput_fd_(-1), udp_fd_(-1),
+          system_control_mode_(false), debug_(debug) {
         init_profiles();
         init_uinput();
         init_udp();
@@ -47,7 +48,7 @@ public:
 
     void set_mode(MacroMode new_mode) {
         mode_ = new_mode;
-        std::cout << "[MacroPad] Switched mode to: " << mode_name() << std::endl;
+        if (debug_) std::cout << "[MacroPad] Switched mode to: " << mode_name() << std::endl;
         if (serial_fd_ >= 0) {
             apply_mode_display();
         }
@@ -63,7 +64,7 @@ public:
         // Auto-reconnect serial if disconnected or not yet plugged in
         if (serial_fd_ < 0) {
             if (open_serial()) {
-                std::cout << "[MacroPad] Connected on " << port_path_ << std::endl;
+                if (debug_) std::cout << "[MacroPad] Connected on " << port_path_ << std::endl;
                 usleep(350000); // Wait 350ms for RP2040 boot screen
                 apply_mode_display();
             } else {
@@ -84,12 +85,11 @@ public:
                 handle_serial_line(line);
             }
      } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-         // Actual USB disconnect / I/O error
-         std::cerr << "[MacroPad] Serial read error: " << strerror(errno) << std::endl;
+         if (debug_) std::cerr << "[MacroPad] Serial read error: " << strerror(errno) << std::endl;
          close(serial_fd_);
          serial_fd_ = -1;
          rx_accum_.clear();
-         std::cout << "[MacroPad] Disconnected." << std::endl;
+         if (debug_) std::cout << "[MacroPad] Disconnected." << std::endl;
      }
 
         // 2. If in PUREDATA mode, forward incoming UDP FUDI packets to MacroPad OLED/LEDs
@@ -107,17 +107,17 @@ public:
 
     void send_fudi(const std::string& cmd) {
         if (serial_fd_ < 0) {
-            std::cerr << "[MacroPad] Warning: serial_fd_ < 0, cannot send: " << cmd << std::endl;
+            if (debug_) std::cerr << "[MacroPad] Warning: serial_fd_ < 0, cannot send: " << cmd << std::endl;
             return;
         }
         std::string pkt = cmd + ";\n";
         ssize_t written = write(serial_fd_, pkt.c_str(), pkt.size());
         if (written < 0) {
-            std::cerr << "[MacroPad] Error writing to serial: " << strerror(errno) << std::endl;
+            if (debug_) std::cerr << "[MacroPad] Error writing to serial: " << strerror(errno) << std::endl;
         } else if (written != static_cast<ssize_t>(pkt.size())) {
-            std::cerr << "[MacroPad] Warning: partial write - wrote " << written << "/" << pkt.size() << " bytes" << std::endl;
+            if (debug_) std::cerr << "[MacroPad] Warning: partial write - wrote " << written << "/" << pkt.size() << " bytes" << std::endl;
         }
-        std::cout << "[MacroPad] Sent: " << cmd << std::endl;
+        if (debug_) std::cout << "[MacroPad] Sent: " << cmd << std::endl;
         usleep(8000); // 8ms pacing for RP2040 buffer
     }
 
@@ -129,6 +129,31 @@ public:
         system_control_mode_ = active;
     }
 
+    void handle_system_control_button(int button) {
+        if (!system_control_mode_) return;
+
+        if (button == 1) {
+            if (debug_) std::cout << "[TT] Button 1 pressed - executing REBOOT" << std::endl;
+            send_fudi("cls");
+            send_fudi("prn 20 25 2 REBOOTING...");
+            usleep(500000);
+            system_control_mode_ = false;
+            system("sudo -n /usr/sbin/reboot");
+        } else if (button == 2) {
+            if (debug_) std::cout << "[TT] Button 2 pressed - executing SHUTDOWN" << std::endl;
+            send_fudi("cls");
+            send_fudi("prn 15 25 2 SHUTTING DOWN...");
+            usleep(500000);
+            system_control_mode_ = false;
+            system("sudo -n /usr/sbin/shutdown -h now");
+        } else if (button == 3) {
+            if (debug_) std::cout << "[TT] Button 3 pressed - CANCEL system control" << std::endl;
+            send_fudi("cls");
+            apply_mode_display();
+            system_control_mode_ = false;
+        }
+    }
+
 private:
     std::string port_path_;
     MacroMode mode_;
@@ -138,6 +163,7 @@ private:
     std::string rx_accum_;
     struct sockaddr_in pd_dest_addr_;
     bool system_control_mode_;  // Track if system reboot/shutdown prompt is active
+    bool debug_;
 
     // Key indices 1..12 mapped to physical positions
     std::map<int, KeyCell> trackwerk_map_;
@@ -205,7 +231,7 @@ private:
     void init_uinput() {
         uinput_fd_ = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
         if (uinput_fd_ < 0) {
-            std::cerr << "[MacroPad] Warning: Could not open /dev/uinput (check permissions/sudo)." << std::endl;
+            if (debug_) std::cerr << "[MacroPad] Warning: Could not open /dev/uinput (check permissions/sudo)." << std::endl;
             return;
         }
         ioctl(uinput_fd_, UI_SET_EVBIT, EV_KEY);
@@ -305,34 +331,13 @@ private:
         }
         if (line.empty()) return;
 
-    std::cout << "[MacroPad] Received: " << line << std::endl;
+    if (debug_) std::cout << "[MacroPad] Received: " << line << std::endl;
 
         // Handle button presses during system control mode (reboot/shutdown prompt)
         int btn = 0, state = 0;
         if (system_control_mode_ && std::sscanf(line.c_str(), "btn %d %d", &btn, &state) == 2 && state == 1) {
-            if (btn == 1) {
-                std::cout << "[MacroPad] Button 1 pressed - executing REBOOT" << std::endl;
-                send_fudi("cls");
-                send_fudi("prn 20 25 2 REBOOTING...");
-                usleep(500000);  // 500ms delay for display
-                system("sudo -n reboot");
-                system_control_mode_ = false;
-                return;
-            } else if (btn == 2) {
-                std::cout << "[MacroPad] Button 2 pressed - executing SHUTDOWN" << std::endl;
-                send_fudi("cls");
-                send_fudi("prn 15 25 2 SHUTTING DOWN...");
-                usleep(500000);  // 500ms delay for display
-                system("sudo -n shutdown -h now");
-                system_control_mode_ = false;
-                return;
-            } else if (btn == 3) {
-                std::cout << "[MacroPad] Button 3 pressed - CANCEL system control" << std::endl;
-                send_fudi("cls");
-                apply_mode_display();  // Restore normal display
-                system_control_mode_ = false;
-                return;
-            }
+            handle_system_control_button(btn);
+            return;
         }
 
         // In PUREDATA mode, forward raw FUDI line straight to Pd on UDP 3001
@@ -349,10 +354,9 @@ reinterpret_cast<struct sockaddr*>(&pd_dest_addr_), sizeof(pd_dest_addr_));
         const auto& active_map = (mode_ == MacroMode::TRACKWERK) ? trackwerk_map_ : choochoo_map_;
         auto it = active_map.find(btn);
         if (it != active_map.end() && it->second.keycode > 0 && (state == 0 || state == 1)) {
-            std::cout << "[MacroPad] Processing button " << btn << " state " << state << " keycode " << it->second.keycode << std::endl;
             send_key(it->second.keycode, state);
         }
     }
-}
+    }
 };
 
