@@ -1,23 +1,24 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <map>
+#include <mutex>
 #include <string>
 #include <vector>
-#include <map>
-#include <algorithm>
 
 #include <fcntl.h>
-#include <unistd.h>
-#include <termios.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
+#include <linux/uinput.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <linux/uinput.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <termios.h>
+#include <unistd.h>
 
 enum class MacroMode { TRACKWERK, CHOOCHOO, PUREDATA };
 
@@ -47,6 +48,7 @@ public:
     }
 
     void set_mode(MacroMode new_mode) {
+        std::lock_guard<std::recursive_mutex> lock(serial_mutex_);
         mode_ = new_mode;
         if (debug_) std::cout << "[MacroPad] Switched mode to: " << mode_name() << std::endl;
         if (serial_fd_ >= 0) {
@@ -61,6 +63,8 @@ public:
     }
 
     void update() {
+        std::lock_guard<std::recursive_mutex> lock(serial_mutex_);
+
         // Auto-reconnect serial if disconnected or not yet plugged in
         if (serial_fd_ < 0) {
             if (open_serial()) {
@@ -106,6 +110,7 @@ public:
     }
 
     void send_fudi(const std::string& cmd) {
+        std::lock_guard<std::recursive_mutex> lock(serial_mutex_);
         if (serial_fd_ < 0) {
             if (debug_) std::cerr << "[MacroPad] Warning: serial_fd_ < 0, cannot send: " << cmd << std::endl;
             return;
@@ -122,14 +127,18 @@ public:
     }
 
     bool is_system_control_mode() const {
+        std::lock_guard<std::recursive_mutex> lock(serial_mutex_);
         return system_control_mode_;
     }
 
     void set_system_control_mode(bool active) {
+        std::lock_guard<std::recursive_mutex> lock(serial_mutex_);
         system_control_mode_ = active;
     }
 
     void handle_system_control_button(int button) {
+        std::lock_guard<std::recursive_mutex> lock(serial_mutex_);
+
         if (!system_control_mode_) return;
 
         if (button == 1) {
@@ -164,6 +173,7 @@ private:
     struct sockaddr_in pd_dest_addr_;
     bool system_control_mode_;  // Track if system reboot/shutdown prompt is active
     bool debug_;
+    mutable std::recursive_mutex serial_mutex_;
 
     // Key indices 1..12 mapped to physical positions
     std::map<int, KeyCell> trackwerk_map_;

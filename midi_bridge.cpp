@@ -43,6 +43,12 @@
 #include <vector>
 #include <string>
 #include <cerrno>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <csignal>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -588,6 +594,185 @@ int init_alsa(snd_seq_t** seq_handle, int& out_port, int& in_port) {
     return 0;
 }
 
+struct MidiEvent {
+    uint8_t cc;
+    uint8_t value;
+};
+
+class MidiEventQueue {
+public:
+    void push(uint8_t cc, uint8_t value) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (events_.size() >= 256) events_.pop_front();
+        events_.push_back({cc, value});
+    }
+
+    bool drain(std::vector<MidiEvent>& out) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (events_.empty()) return false;
+        out.assign(events_.begin(), events_.end());
+        events_.clear();
+        return true;
+    }
+
+private:
+    std::mutex mutex_;
+    std::deque<MidiEvent> events_;
+};
+
+enum class GpioEventType : uint8_t {
+    BUTTON,
+    GATE
+};
+
+struct GpioEvent {
+    GpioEventType type;
+    uint8_t index;
+    uint8_t state;
+};
+
+class GpioEventQueue {
+public:
+    void push(GpioEventType type, uint8_t index, uint8_t state) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (events_.size() >= 256) events_.pop_front();
+        events_.push_back({type, index, state});
+    }
+
+    bool drain(std::vector<GpioEvent>& out) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (events_.empty()) return false;
+        out.assign(events_.begin(), events_.end());
+        events_.clear();
+        return true;
+    }
+
+private:
+    std::mutex mutex_;
+    std::deque<GpioEvent> events_;
+};
+
+static std::atomic<bool> g_stop_requested(false);
+
+void request_stop(int) {
+    g_stop_requested.store(true, std::memory_order_release);
+}
+
+// ============================================================================
+// Sensor Thread - Independent Worker for Polling I2C/SPI
+// ============================================================================
+
+void sensor_thread_main(int i2c_fd, int spi_fd, bool is_14bit,
+                        MidiEventQueue& midi_events,
+                        std::atomic<bool>& stop_requested) {
+    std::vector<uint16_t> last_fader_values(NUM_FADERS, 0xFFFF);
+    std::vector<uint8_t> last_pot_values(NUM_TT_POTS, 0xFF);
+    std::vector<uint16_t> last_pot_raw(NUM_TT_POTS, 0xFFFF);
+
+    auto next_poll = std::chrono::steady_clock::now();
+    while (!stop_requested.load(std::memory_order_acquire)) {
+        next_poll += std::chrono::microseconds(POLL_INTERVAL_US);
+
+        for (uint8_t i = 0; i < NUM_FADERS; ++i) {
+            uint16_t raw_val = 0;
+            if (read_fader_i2c(i2c_fd, i, raw_val) == 0) {
+                if (is_14bit) {
+                    if (last_fader_values[i] == 0xFFFF ||
+                        std::abs(static_cast<int>(raw_val) - static_cast<int>(last_fader_values[i])) > FADER_DEADZONE) {
+                        last_fader_values[i] = raw_val;
+                        midi_events.push(i, (raw_val >> 7) & 0x7F);
+                        midi_events.push(i + 32, raw_val & 0x7F);
+                    }
+                } else {
+                    uint8_t val_7bit = (raw_val >> 7) & 0x7F;
+                    if (last_fader_values[i] != val_7bit) {
+                        last_fader_values[i] = val_7bit;
+                        midi_events.push(i, val_7bit);
+                    }
+                }
+            }
+        }
+
+        if (spi_fd >= 0) {
+            for (uint8_t p = 0; p < NUM_TT_POTS; ++p) {
+                uint16_t adc_raw = 0;
+                if (read_mcp3208_spi(spi_fd, p, adc_raw) == 0) {
+                    if (last_pot_raw[p] == 0xFFFF ||
+                        std::abs(static_cast<int>(adc_raw) - static_cast<int>(last_pot_raw[p])) >= POT_DEADZONE) {
+                        last_pot_raw[p] = adc_raw;
+                        uint8_t val_7bit = (adc_raw >> 5) & 0x7F;
+                        if (last_pot_values[p] != val_7bit) {
+                            last_pot_values[p] = val_7bit;
+                            midi_events.push(TT_CC_OFFSET + p, val_7bit);
+                        }
+                    }
+                }
+            }
+        }
+
+        std::this_thread::sleep_until(next_poll);
+    }
+}
+
+// ============================================================================
+// GPIO Thread - Independent Worker for Polling GPIO Inputs
+// ============================================================================
+
+void gpio_thread_main(GpioEventQueue& gpio_events,
+                      std::atomic<bool>& stop_requested) {
+    int button_states[NUM_TT_BUTTONS] = {
+        read_button_libgpiod(0),
+        read_button_libgpiod(1),
+        read_button_libgpiod(2)
+    };
+    int gate_states[NUM_TT_GATES_IN] = {0, 0, 0, 0};
+    for (int i = 0; i < NUM_TT_GATES_IN; ++i)
+        gate_states[i] = read_gate_input_libgpiod(i);
+
+    auto next_poll = std::chrono::steady_clock::now();
+    while (!stop_requested.load(std::memory_order_acquire)) {
+        next_poll += std::chrono::microseconds(POLL_INTERVAL_US);
+
+        for (int i = 0; i < NUM_TT_BUTTONS; ++i) {
+            int state = read_button_libgpiod(i);
+            if (state >= 0 && state != button_states[i]) {
+                button_states[i] = state;
+                gpio_events.push(GpioEventType::BUTTON, static_cast<uint8_t>(i), static_cast<uint8_t>(state));
+            }
+        }
+
+        for (int i = 0; i < NUM_TT_GATES_IN; ++i) {
+            int state = read_gate_input_libgpiod(i);
+            if (state >= 0 && state != gate_states[i]) {
+                gate_states[i] = state;
+                gpio_events.push(GpioEventType::GATE, static_cast<uint8_t>(i), static_cast<uint8_t>(state));
+            }
+        }
+
+        std::this_thread::sleep_until(next_poll);
+    }
+}
+
+// ============================================================================
+// MIDI Thread - Independent Worker for ALSA Input and MIDI Output
+// ============================================================================
+
+void midi_thread_main(snd_seq_t* seq_handle, int i2c_fd, int out_port,
+                      MacroPadBridge& macropad, MidiEventQueue& midi_events,
+                      std::atomic<bool>& stop_requested) {
+    while (!stop_requested.load(std::memory_order_acquire)) {
+        process_alsa_input(seq_handle, i2c_fd, macropad);
+
+        std::vector<MidiEvent> pending_events;
+        if (midi_events.drain(pending_events)) {
+            for (const MidiEvent& event : pending_events)
+                send_alsa_cc(seq_handle, out_port, MIDI_CHANNEL, event.cc, event.value);
+        }
+
+        std::this_thread::sleep_for(std::chrono::microseconds(POLL_INTERVAL_US));
+    }
+}
+
 // ============================================================================
 // Main Program
 // ============================================================================
@@ -607,23 +792,16 @@ int main(int argc, char* argv[]) {
     }
 
     MacroMode macro_mode = MacroMode::CHOOCHOO;
-    int arg_idx = 2;
-    
-    if (arg_idx < argc) {
-        std::string m = argv[arg_idx];
-        if (m == "trackwerk") macro_mode = MacroMode::TRACKWERK;
-        else if (m == "choochoo") macro_mode = MacroMode::CHOOCHOO;
-        else if (m == "puredata") macro_mode = MacroMode::PUREDATA;
-        else if (m == "--debug") {
-            g_debug = true;
-            arg_idx++;
-        } else {
-            arg_idx++;
+    for (int arg_idx = 2; arg_idx < argc; ++arg_idx) {
+        std::string arg = argv[arg_idx];
+        if (arg == "trackwerk") macro_mode = MacroMode::TRACKWERK;
+        else if (arg == "choochoo") macro_mode = MacroMode::CHOOCHOO;
+        else if (arg == "puredata") macro_mode = MacroMode::PUREDATA;
+        else if (arg == "--debug") g_debug = true;
+        else {
+            DEBUG_CERR("Invalid MacroPad mode '" << arg << "'." << std::endl);
+            return 1;
         }
-    }
-    
-    if (arg_idx < argc && std::string(argv[arg_idx]) == "--debug") {
-        g_debug = true;
     }
 
     // Initialize hardware
@@ -673,149 +851,81 @@ int main(int argc, char* argv[]) {
         usleep(500000);
     }
 
-    // State tracking for hysteresis (deadzone filtering)
-    std::vector<uint16_t> last_fader_values(NUM_FADERS, 0xFFFF);
-    std::vector<uint8_t> last_pot_values(NUM_TT_POTS, 0xFF);
-    std::vector<uint16_t> last_pot_raw(NUM_TT_POTS, 0xFFFF);
-    
-    // Terminal Tedium button state tracking
-    int last_btn1_state = read_button_libgpiod(0);
-    int last_btn2_state = read_button_libgpiod(1);
-    int last_btn3_state = read_button_libgpiod(2);
-    
-    // Terminal Tedium gate input state tracking
-    int last_gate_in[NUM_TT_GATES_IN] = {0, 0, 0, 0};
+    // Install SIGINT/SIGTERM handlers for clean threaded shutdown
+    std::signal(SIGINT, request_stop);
+    std::signal(SIGTERM, request_stop);
+
+    MidiEventQueue midi_events;
+    std::thread sensor_thread(sensor_thread_main, i2c_fd, spi_fd, is_14bit,
+                              std::ref(midi_events), std::ref(g_stop_requested));
+    GpioEventQueue gpio_events;
+    std::thread gpio_thread(gpio_thread_main, std::ref(gpio_events), std::ref(g_stop_requested));
+    std::thread macropad_thread([&macropad]() {
+        auto next_poll = std::chrono::steady_clock::now();
+        while (!g_stop_requested.load(std::memory_order_acquire)) {
+            next_poll += std::chrono::milliseconds(5);
+            macropad.update();
+            std::this_thread::sleep_until(next_poll);
+        }
+    });
+    std::thread midi_thread(midi_thread_main, seq_handle, i2c_fd, out_port,
+                            std::ref(macropad), std::ref(midi_events), std::ref(g_stop_requested));
+
+    int button_states[NUM_TT_BUTTONS] = {
+        read_button_libgpiod(0),
+        read_button_libgpiod(1),
+        read_button_libgpiod(2)
+    };
+    int gate_states[NUM_TT_GATES_IN] = {0, 0, 0, 0};
+    for (int i = 0; i < NUM_TT_GATES_IN; ++i)
+        gate_states[i] = read_gate_input_libgpiod(i);
 
     // Main event loop
-    while (true) {
-        // Process incoming MIDI events (e.g., from DAW)
-        process_alsa_input(seq_handle, i2c_fd, macropad);
+    while (!g_stop_requested.load(std::memory_order_acquire)) {
+        std::vector<GpioEvent> gpio_events_pending;
+        if (gpio_events.drain(gpio_events_pending)) {
+            for (const GpioEvent& event : gpio_events_pending) {
+                if (event.type == GpioEventType::BUTTON) {
+                    int previous = button_states[event.index];
+                    button_states[event.index] = event.state;
+                    DEBUG_PRINT("TT Button %d state: %d\n", event.index + 1, event.state);
 
-        // Update MacroPad state - capture any button presses for system control
-        macropad.update();
-
-        // Poll Terminal Tedium buttons
-        int btn1_state = read_button_libgpiod(0);
-        int btn2_state = read_button_libgpiod(1);
-        int btn3_state = read_button_libgpiod(2);
-
-        if (btn1_state != last_btn1_state)
-            DEBUG_PRINT("TT Button 1 state: %d\n", btn1_state);
-        if (btn2_state != last_btn2_state)
-            DEBUG_PRINT("TT Button 2 state: %d\n", btn2_state);
-        if (btn3_state != last_btn3_state)
-            DEBUG_PRINT("TT Button 3 state: %d\n", btn3_state);
-
-        if (macropad.is_system_control_mode()) {
-            if (btn1_state == 1 && last_btn1_state == 0)
-                macropad.handle_system_control_button(1);
-            if (btn2_state == 1 && last_btn2_state == 0)
-                macropad.handle_system_control_button(2);
-            if (btn3_state == 1 && last_btn3_state == 0)
-                macropad.handle_system_control_button(3);
-        }
-        
-        // Detect button events (rising edges - when button is pressed)
-        if (!macropad.is_system_control_mode()) {
-            if (btn1_state == 1 && last_btn1_state == 0) {
-                if (g_debug) {
-                    macropad.send_fudi("cls");
-                    macropad.send_fudi("prn 20 10 1 BUTTON 1");
-                    std::cout << "[TT] Button 1 pressed" << std::endl;
-                }
-            }
-            if (btn2_state == 1 && last_btn2_state == 0) {
-                if (g_debug) {
-                    macropad.send_fudi("cls");
-                    macropad.send_fudi("prn 20 10 1 BUTTON 2");
-                    std::cout << "[TT] Button 2 pressed" << std::endl;
-                }
-            }
-            if (btn3_state == 1 && last_btn3_state == 0) {
-                if (g_debug) {
-                    macropad.send_fudi("cls");
-                    macropad.send_fudi("prn 20 10 1 BUTTON 3");
-                    std::cout << "[TT] Button 3 pressed" << std::endl;
-                }
-            }
-        }
-        
-        // Detect button combo: 1+2 pressed (rising edge)
-        if (!macropad.is_system_control_mode() && btn1_state == 1 && btn2_state == 1 && last_btn1_state == 0) {
-            macropad.set_system_control_mode(true);
-            // Send display message to MacroPad
-            macropad.send_fudi("cls");
-            macropad.send_fudi("prn 20 10 1 REBOOT?");
-            macropad.send_fudi("prn 20 25 1 SHUTDOWN?");
-            macropad.send_fudi("prn 15 40 1 CANCEL?");
-            if (g_debug) std::cout << "[TT] Button combo 1+2 detected - showing system control prompt" << std::endl;
-        }
-        
-        last_btn1_state = btn1_state;
-        last_btn2_state = btn2_state;
-        last_btn3_state = btn3_state;
-
-        // Poll Terminal Tedium gate inputs (for future use)
-        int gate_in_states[NUM_TT_GATES_IN];
-        gate_in_states[0] = read_gate_input_libgpiod(0);
-        gate_in_states[1] = read_gate_input_libgpiod(1);
-        gate_in_states[2] = read_gate_input_libgpiod(2);
-        gate_in_states[3] = read_gate_input_libgpiod(3);
-        
-        // Detect gate input changes (rising edges)
-        for (int g = 0; g < NUM_TT_GATES_IN; ++g) {
-            if (gate_in_states[g] == 1 && last_gate_in[g] == 0) {
-                DEBUG_PRINT("TT Gate Input %d TRIGGERED\n", g + 1);
-                // Gate input triggered - available for future use
-            }
-            last_gate_in[g] = gate_in_states[g];
-        }
-
-        // Poll and send fader values
-        for (uint8_t i = 0; i < NUM_FADERS; ++i) {
-            uint16_t raw_val = 0;
-            if (read_fader_i2c(i2c_fd, i, raw_val) == 0) {
-                if (is_14bit) {
-                    // 14-bit mode: send as two 7-bit CC values
-                    // CC N = MSB (bits 13-7), CC N+32 = LSB (bits 6-0)
-                    if (last_fader_values[i] == 0xFFFF || 
-                        std::abs(static_cast<int>(raw_val) - static_cast<int>(last_fader_values[i])) > FADER_DEADZONE) {
-                        last_fader_values[i] = raw_val;
-                        send_alsa_cc(seq_handle, out_port, MIDI_CHANNEL, i, (raw_val >> 7) & 0x7F);
-                        send_alsa_cc(seq_handle, out_port, MIDI_CHANNEL, i + 32, raw_val & 0x7F);
-                    }
-                } else {
-                    // 7-bit mode: send only MSB
-                    uint8_t val_7bit = (raw_val >> 7) & 0x7F;
-                    if (last_fader_values[i] != val_7bit) {
-                        last_fader_values[i] = val_7bit;
-                        send_alsa_cc(seq_handle, out_port, MIDI_CHANNEL, i, val_7bit);
-                    }
-                }
-            }
-        }
-
-        // Poll and send pot values (if SPI is available)
-        if (spi_fd >= 0) {
-            for (uint8_t p = 0; p < NUM_TT_POTS; ++p) {
-                uint16_t adc_raw = 0;
-                if (read_mcp3208_spi(spi_fd, p, adc_raw) == 0) {
-                    // Apply hysteresis to avoid jitter
-                    if (last_pot_raw[p] == 0xFFFF || 
-                        std::abs(static_cast<int>(adc_raw) - static_cast<int>(last_pot_raw[p])) >= POT_DEADZONE) {
-                        last_pot_raw[p] = adc_raw;
-                        uint8_t val_7bit = (adc_raw >> 5) & 0x7F;
-                        if (last_pot_values[p] != val_7bit) {
-                            last_pot_values[p] = val_7bit;
-                            send_alsa_cc(seq_handle, out_port, MIDI_CHANNEL, TT_CC_OFFSET + p, val_7bit);
+                    if (macropad.is_system_control_mode()) {
+                        if (event.state == 1)
+                            macropad.handle_system_control_button(event.index + 1);
+                    } else if (event.state == 1 && previous == 0) {
+                        if (g_debug) {
+                            macropad.send_fudi("cls");
+                            macropad.send_fudi("prn 20 10 1 BUTTON " + std::to_string(event.index + 1));
                         }
                     }
+
+                    if (!macropad.is_system_control_mode() &&
+                        button_states[0] == 1 && button_states[1] == 1) {
+                        macropad.set_system_control_mode(true);
+                        macropad.send_fudi("cls");
+                        macropad.send_fudi("prn 20 10 1 REBOOT?");
+                        macropad.send_fudi("prn 20 25 1 SHUTDOWN?");
+                        macropad.send_fudi("prn 15 40 1 CANCEL?");
+                        if (g_debug) std::cout << "[TT] Button combo 1+2 detected - showing system control prompt" << std::endl;
+                    }
+                } else {
+                    int previous = gate_states[event.index];
+                    gate_states[event.index] = event.state;
+                    if (event.state == 1 && previous == 0)
+                        DEBUG_PRINT("TT Gate Input %d TRIGGERED\n", event.index + 1);
                 }
             }
         }
 
         usleep(POLL_INTERVAL_US);
     }
+
+    g_stop_requested.store(true, std::memory_order_release);
+    if (sensor_thread.joinable()) sensor_thread.join();
+    if (gpio_thread.joinable()) gpio_thread.join();
+    if (macropad_thread.joinable()) macropad_thread.join();
+    if (midi_thread.joinable()) midi_thread.join();
 
     // Cleanup
     cleanup_gpio_libgpiod();
