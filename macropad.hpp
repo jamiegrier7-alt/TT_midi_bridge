@@ -30,7 +30,7 @@ struct KeyCell {
 class MacroPadBridge {
 public:
     MacroPadBridge(const std::string& serial_dev, MacroMode initial_mode)
-        : port_path_(serial_dev), mode_(initial_mode), serial_fd_(-1), uinput_fd_(-1), udp_fd_(-1) {
+        : port_path_(serial_dev), mode_(initial_mode), serial_fd_(-1), uinput_fd_(-1), udp_fd_(-1), system_control_mode_(false) {
         init_profiles();
         init_uinput();
         init_udp();
@@ -85,6 +85,7 @@ public:
             }
      } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
          // Actual USB disconnect / I/O error
+         std::cerr << "[MacroPad] Serial read error: " << strerror(errno) << std::endl;
          close(serial_fd_);
          serial_fd_ = -1;
          rx_accum_.clear();
@@ -104,6 +105,30 @@ public:
         }
     }
 
+    void send_fudi(const std::string& cmd) {
+        if (serial_fd_ < 0) {
+            std::cerr << "[MacroPad] Warning: serial_fd_ < 0, cannot send: " << cmd << std::endl;
+            return;
+        }
+        std::string pkt = cmd + ";\n";
+        ssize_t written = write(serial_fd_, pkt.c_str(), pkt.size());
+        if (written < 0) {
+            std::cerr << "[MacroPad] Error writing to serial: " << strerror(errno) << std::endl;
+        } else if (written != static_cast<ssize_t>(pkt.size())) {
+            std::cerr << "[MacroPad] Warning: partial write - wrote " << written << "/" << pkt.size() << " bytes" << std::endl;
+        }
+        std::cout << "[MacroPad] Sent: " << cmd << std::endl;
+        usleep(8000); // 8ms pacing for RP2040 buffer
+    }
+
+    bool is_system_control_mode() const {
+        return system_control_mode_;
+    }
+
+    void set_system_control_mode(bool active) {
+        system_control_mode_ = active;
+    }
+
 private:
     std::string port_path_;
     MacroMode mode_;
@@ -112,6 +137,7 @@ private:
     int udp_fd_;
     std::string rx_accum_;
     struct sockaddr_in pd_dest_addr_;
+    bool system_control_mode_;  // Track if system reboot/shutdown prompt is active
 
     // Key indices 1..12 mapped to physical positions
     std::map<int, KeyCell> trackwerk_map_;
@@ -119,33 +145,33 @@ private:
 
     void init_profiles() {
         trackwerk_map_ = {
-            {1,  {KEY_LEFTSHIFT, "SHFT", 40, 20, 0}},
-            {5,  {KEY_SPACE,     "PLAY", 0,  50, 10}},
-            {9,  {KEY_F11,       "F11",  40, 0,  40}},
-            {2,  {KEY_U,         "U",    20, 20, 40}},
+            {1,  {KEY_LEFTSHIFT, "SHFT", 0, 0, 0}},
+            {5,  {KEY_SPACE,     "PLAY", 0,  0, 0}},
+            {9,  {KEY_F11,       "F11",  0, 0,  0}},
+            {2,  {KEY_U,         "U",    0, 0, 0}},
             {6,  {0,             "---",  0,  0,  0}},
-            {10, {KEY_I,         "I",    20, 20, 40}},
-            {3,  {KEY_J,         "J",    20, 20, 40}},
-            {7,  {KEY_UP,        "UP",   0,  30, 50}},
-            {11, {KEY_K,         "K",    20, 20, 40}},
-            {4,  {KEY_LEFT,      "LEFT", 0,  30, 50}},
-            {8,  {KEY_DOWN,      "DOWN", 0,  30, 50}},
-            {12, {KEY_RIGHT,     "RGHT", 0,  30, 50}}
+            {10, {KEY_I,         "I",    0, 0, 0}},
+            {3,  {KEY_J,         "J",    0, 0, 0}},
+            {7,  {KEY_UP,        "UP",   0,  0, 0}},
+            {11, {KEY_K,         "K",    0, 0, 0}},
+            {4,  {KEY_LEFT,      "LEFT", 0,  0, 0}},
+            {8,  {KEY_DOWN,      "DOWN", 0,  0, 0}},
+            {12, {KEY_RIGHT,     "RGHT", 0,  0, 0}}
         };
 
         choochoo_map_ = {
-            {1,  {KEY_W,         "W",    30, 15, 40}},
-            {5,  {KEY_SPACE,     "PLAY", 0,  50, 10}},
-            {9,  {KEY_E,         "E",    30, 15, 40}},
-            {2,  {KEY_LEFTSHIFT, "SHFT", 40, 20, 0}},
-            {6,  {KEY_Q,         "Q",    30, 15, 40}},
-            {10, {KEY_ESC,       "ESC",  50, 10, 10}},
-            {3,  {KEY_Z,         "EDIT", 0,  45, 30}},
-            {7,  {KEY_UP,        "UP",   0,  30, 50}},
-            {11, {KEY_X,         "OPT",  45, 30, 0}},
-            {4,  {KEY_LEFT,      "LEFT", 0,  30, 50}},
-            {8,  {KEY_DOWN,      "DOWN", 0,  30, 50}},
-            {12, {KEY_RIGHT,     "RGHT", 0,  30, 50}}
+            {1,  {KEY_W,         "REC",    0, 0, 0}},
+            {5,  {KEY_Q,         "LIVE",    0,  0, 0}},
+            {9,  {KEY_E,         "DEL",    0, 0, 0}},
+            {2,  {KEY_LEFTSHIFT, "SHFT", 0, 0, 0}},
+            {6,  {KEY_SPACE,     "PLAY", 0, 0, 0}},
+            {10, {KEY_ESC,       "ESC",  0, 0, 0}},
+            {3,  {KEY_Z,         "EDIT", 0,  0, 0}},
+            {7,  {KEY_UP,        "UP",   0,  0, 0}},
+            {11, {KEY_X,         "OPT",  0, 0, 0}},
+            {4,  {KEY_LEFT,      "LEFT", 0,  0, 0}},
+            {8,  {KEY_DOWN,      "DOWN", 0,  0, 0}},
+            {12, {KEY_RIGHT,     "RGHT", 0,  0, 0}}
         };
     }
 
@@ -220,13 +246,6 @@ private:
         pd_dest_addr_.sin_port = htons(3001);
     }
 
-    void send_fudi(const std::string& cmd) {
-        if (serial_fd_ < 0) return;
-        std::string pkt = cmd + ";\n";
-        write(serial_fd_, pkt.c_str(), pkt.size());
-        usleep(8000); // 8ms pacing for RP2040 buffer
-    }
-
     void send_key(int keycode, int value) {
         if (uinput_fd_ < 0 || keycode <= 0) return;
         struct input_event ev;
@@ -248,7 +267,7 @@ private:
         send_fudi("rgb_clr");
 
         if (mode_ == MacroMode::PUREDATA) {
-            send_fudi("prn 10 15 2 FUDI MODE");
+            send_fudi("prn 10 15 2 PD MODE");
             send_fudi("drw_line 10 35 118 35");
             send_fudi("prn 20 45 1 Pure Data UDP");
             return;
@@ -286,23 +305,54 @@ private:
         }
         if (line.empty()) return;
 
+    std::cout << "[MacroPad] Received: " << line << std::endl;
+
+        // Handle button presses during system control mode (reboot/shutdown prompt)
+        int btn = 0, state = 0;
+        if (system_control_mode_ && std::sscanf(line.c_str(), "btn %d %d", &btn, &state) == 2 && state == 1) {
+            if (btn == 1) {
+                std::cout << "[MacroPad] Button 1 pressed - executing REBOOT" << std::endl;
+                send_fudi("cls");
+                send_fudi("prn 20 25 2 REBOOTING...");
+                usleep(500000);  // 500ms delay for display
+                system("sudo -n reboot");
+                system_control_mode_ = false;
+                return;
+            } else if (btn == 2) {
+                std::cout << "[MacroPad] Button 2 pressed - executing SHUTDOWN" << std::endl;
+                send_fudi("cls");
+                send_fudi("prn 15 25 2 SHUTTING DOWN...");
+                usleep(500000);  // 500ms delay for display
+                system("sudo -n shutdown -h now");
+                system_control_mode_ = false;
+                return;
+            } else if (btn == 3) {
+                std::cout << "[MacroPad] Button 3 pressed - CANCEL system control" << std::endl;
+                send_fudi("cls");
+                apply_mode_display();  // Restore normal display
+                system_control_mode_ = false;
+                return;
+            }
+        }
+
         // In PUREDATA mode, forward raw FUDI line straight to Pd on UDP 3001
         if (mode_ == MacroMode::PUREDATA) {
             if (udp_fd_ >= 0) {
                 std::string fwd = line + ";\n";
                 sendto(udp_fd_, fwd.c_str(), fwd.size(), 0,
 reinterpret_cast<struct sockaddr*>(&pd_dest_addr_), sizeof(pd_dest_addr_));
-}
-return;
-}
-// In TRACKWERK / CHOOCHOO mode, parse "btn  "
-int btn = 0, state = 0;
-if (std::sscanf(line.c_str(), "btn %d %d", &btn, &state) == 2) {
-const auto& active_map = (mode_ == MacroMode::TRACKWERK) ? trackwerk_map_ : choochoo_map_;
-auto it = active_map.find(btn);
-if (it != active_map.end() && it->second.keycode > 0 && (state == 0 || state == 1)) {
-send_key(it->second.keycode, state);
-}
-}
+        }
+        return;
+    }
+    // In TRACKWERK / CHOOCHOO mode, parse "btn  " normally
+    if (std::sscanf(line.c_str(), "btn %d %d", &btn, &state) == 2) {
+        const auto& active_map = (mode_ == MacroMode::TRACKWERK) ? trackwerk_map_ : choochoo_map_;
+        auto it = active_map.find(btn);
+        if (it != active_map.end() && it->second.keycode > 0 && (state == 0 || state == 1)) {
+            std::cout << "[MacroPad] Processing button " << btn << " state " << state << " keycode " << it->second.keycode << std::endl;
+            send_key(it->second.keycode, state);
+        }
+    }
 }
 };
+
